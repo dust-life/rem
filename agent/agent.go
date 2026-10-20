@@ -452,7 +452,14 @@ func (agent *Agent) handlerInbound(local, remote *core.URL, control *message.Con
 	options["server"] = agent.ExternalIP
 	if local.Scheme == core.PortForwardServe || local.Scheme == core.RawServe {
 		options["src"] = local.Host
-		options["dest"] = remote.Host
+		// An explicit dest on the serve URL (e.g. raw://0.0.0.0:8080?dest=
+		// target:80) wins over the peer URL's address. The peer-derived dest
+		// stays the default so classic -l raw/-r target pairings are unchanged;
+		// the override is what lets the accept side of a dial-in run a
+		// static-dest inbound (the peer has no address to contribute there).
+		if options["dest"] == "" {
+			options["dest"] = remote.Host
+		}
 	}
 
 	if local.Tunnel == core.MemoryTunnel {
@@ -478,8 +485,14 @@ func (agent *Agent) handlerOutbound(local, remote *core.URL, control *message.Co
 	options := utils.MergeMaps(control.Options, local.Options())
 	switch local.Scheme {
 	case core.PortForwardServe, core.CobaltStrikeServe:
-		options["src"] = remote.Host
-		options["dest"] = local.Host
+		// Same explicit-override rule as handlerInbound: a dest/src carried on
+		// the serve URL itself wins over the derived peer address.
+		if options["src"] == "" {
+			options["src"] = remote.Host
+		}
+		if options["dest"] == "" {
+			options["dest"] = local.Host
+		}
 	}
 
 	instant, err := core.OutboundCreate(local.Scheme, options, agent.client)
