@@ -49,6 +49,18 @@ func RemDial(cmdline *C.char) (*C.char, C.int) {
 	if err != nil {
 		return nil, ErrCmdParseFailed
 	}
+	// `rem_dial stop <agent>` is a control verb, not a dial: close the named
+	// agent. Its control streams drop, which tears down the paired
+	// console-side agent (and any listener it serves) through the normal
+	// handler-exit path. The flag parser rejects positional arguments, so
+	// the verb must be intercepted here.
+	if id, ok := stopVerb(args); ok {
+		stopped, code := stopAgentGo(id)
+		if code != 0 {
+			return nil, C.int(code)
+		}
+		return C.CString(stopped), 0
+	}
 	err = option.ParseArgs(args)
 	if err != nil {
 		return nil, ErrArgsParseFailed
@@ -110,6 +122,27 @@ func RemDial(cmdline *C.char) (*C.char, C.int) {
 	}
 
 	return C.CString(a.ID), 0
+}
+
+// stopVerb reports whether args are the `stop <agent>` control verb.
+func stopVerb(args []string) (string, bool) {
+	if len(args) == 2 && args[0] == "stop" {
+		return args[1], true
+	}
+	return "", false
+}
+
+func stopAgentGo(id string) (string, int) {
+	a, ok := agent.Agents.Get(id)
+	if !ok {
+		return "", ErrAgentNotFound
+	}
+	a.Close(fmt.Errorf("stop by manual"))
+	// CompareAndDelete (not an unconditional Delete), same as the
+	// handler-exit path: a same-alias agent from a later RemDial may have
+	// registered after Close ran, and its entry must not be evicted.
+	agent.Agents.CompareAndDelete(a.ID, a)
+	return id, 0
 }
 
 // ========================================================================

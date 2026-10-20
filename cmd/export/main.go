@@ -10,6 +10,7 @@ const (
 	ErrCreateConsole   = core.ErrCreateConsole
 	ErrDialFailed      = core.ErrDialFailed
 	ErrWouldBlock      = core.ErrWouldBlock
+	ErrAgentNotFound   = core.ErrAgentNotFound
 )
 
 var conns = &core.Conns
