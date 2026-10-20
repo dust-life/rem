@@ -121,6 +121,7 @@ type Agent struct {
 	session        *yamux.Session // yamux multiplexer over Conn
 	stream0        net.Conn       // tinygo poll mode uses stream0 directly
 	pendingStreams sync.Map       // map[uint64]net.Conn — data streams waiting for BridgeOpen
+	redirectRoutes sync.Map       // map[uint64]*Agent — bridge opens this agent forwarded to another agent (server-side redirect data plane)
 	ctx            context.Context
 	canceler       context.CancelFunc
 	client         core.ContextDialer
@@ -389,6 +390,59 @@ func (agent *Agent) routeControl(control *message.Control) bool {
 	return true
 }
 
+// redirectBridgeOpen forwards a BridgeOpen toward the agent named by
+// m.Destination when this agent is an intermediate hop for it (the server
+// side of a -d redirect pair). Control messages already cross the redirect
+// hop via routeControl; without this the bridge open would terminate on the
+// intermediate agent, which runs no inbound/outbound, and the data path
+// would blackhole. Routes are recorded on both agents so the matching data
+// stream and a later BridgeClose can follow in either direction. Reports
+// whether the open was forwarded.
+func (agent *Agent) redirectBridgeOpen(m *message.BridgeOpen) bool {
+	if agent.Type == core.CLIENT {
+		return false
+	}
+	if m.Destination == "" || m.Destination == agent.ID {
+		return false
+	}
+	des, ok := Agents.Get(m.Destination)
+	if !ok || des == agent {
+		return false
+	}
+	if err := des.Send(m); err != nil {
+		agent.Log("redirect", logs.ErrorLevel, "forward bridge %d to %s failed: %v", m.ID, m.Destination, err)
+		return false
+	}
+	agent.redirectRoutes.Store(m.ID, des)
+	des.redirectRoutes.Store(m.ID, agent)
+	// The data stream may have arrived before the open was processed; the
+	// post-park re-check in handleDataStream covers the opposite race.
+	if v, ok := agent.pendingStreams.LoadAndDelete(m.ID); ok {
+		go agent.relayRedirectStream(m.ID, v.(net.Conn), des)
+	}
+	return true
+}
+
+// relayRedirectStream joins an incoming bridge data stream to a fresh stream
+// opened on the destination agent's connection, completing the redirect data
+// path across this (intermediate) agent.
+func (agent *Agent) relayRedirectStream(bridgeID uint64, stream net.Conn, des *Agent) {
+	peer, _, err := des.openBridgeStream(bridgeID)
+	if err != nil {
+		agent.Log("redirect", logs.ErrorLevel, "open stream to %s for bridge %d failed: %v", des.ID, bridgeID, err)
+		stream.Close()
+		return
+	}
+	if err := writeStreamID(peer, bridgeID); err != nil {
+		agent.Log("redirect", logs.ErrorLevel, "write bridge %d header to %s failed: %v", bridgeID, des.ID, err)
+		stream.Close()
+		peer.Close()
+		return
+	}
+	in, out, errors := cio.JoinWithError(stream, peer)
+	agent.Log("redirect", logs.DebugLevel, "bridge %d to %s relayed: in: %d, out: %d, errors: %v", bridgeID, des.ID, in, out, errors)
+}
+
 func (agent *Agent) Fork(ctrl *message.Control) (*Agent, error) {
 	agent.closeMu.Lock()
 	defer agent.closeMu.Unlock()
@@ -619,6 +673,9 @@ func (agent *Agent) handleMessage() error {
 			// Route to child agent if the source matches a forked child.
 			if child := agent.findChildForBridge(m.Source); child != nil {
 				child.handleBridgeOpen(m)
+			} else if agent.redirectBridgeOpen(m) {
+				// Intermediate redirect hop: forwarded toward m.Destination;
+				// the matching data stream follows the recorded route.
 			} else {
 				agent.handleBridgeOpen(m)
 			}
@@ -643,6 +700,18 @@ func (agent *Agent) handleMessage() error {
 					}
 					target.bridgeMap.Delete(bridge.id)
 				}()
+			} else if des, ok := agent.redirectRoutes.LoadAndDelete(m.ID); ok {
+				// Redirect hop: the bridge lives on the paired agents, so the
+				// close must cross this agent the same way the open did. A
+				// delivered close ends the bridge on both sides, so the
+				// reverse route on the destination agent goes away with it;
+				// on a failed send it stays, giving a close originating from
+				// the other direction a path across later.
+				if err := des.(*Agent).Send(m); err != nil {
+					agent.Log("redirect", logs.ErrorLevel, "forward bridge %d close failed: %v", m.ID, err)
+				} else {
+					des.(*Agent).redirectRoutes.Delete(m.ID)
+				}
 			} else {
 				agent.releaseBridgeRoute(m.ID)
 			}
@@ -1115,6 +1184,14 @@ func (agent *Agent) handleDataStream(stream net.Conn) {
 		return
 	}
 
+	// Redirect hop: a BridgeOpen this agent forwarded earlier claims the
+	// stream; relay it onto the destination agent's connection. The route
+	// stays recorded so the later BridgeClose can follow the same path.
+	if des, ok := agent.redirectRoutes.Load(id); ok {
+		go agent.relayRedirectStream(id, stream, des.(*Agent))
+		return
+	}
+
 	// BridgeOpen hasn't arrived yet — park the stream in parent's pendingStreams.
 	// handleBridgeOpen (dispatched by parent) will check here. Re-check the
 	// bridge map after storing to close the race where BridgeOpen is handled
@@ -1139,6 +1216,16 @@ func (agent *Agent) handleDataStream(stream net.Conn) {
 		}
 		return true
 	})
+
+	// Same race for the redirect route: redirectBridgeOpen may have recorded
+	// it between the first check and the park (its own parked-stream pickup
+	// covers the reverse order).
+	if des, ok := agent.redirectRoutes.Load(id); ok {
+		if value, loaded := agent.pendingStreams.LoadAndDelete(id); loaded {
+			go agent.relayRedirectStream(id, value.(net.Conn), des.(*Agent))
+		}
+		return
+	}
 }
 
 // handleBridgeOpen processes a BridgeOpen received on stream 0.
